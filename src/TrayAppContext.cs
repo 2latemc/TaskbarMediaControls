@@ -1,4 +1,5 @@
 ﻿using Microsoft.Win32;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace TaskbarMediaControls {
@@ -18,6 +19,7 @@ namespace TaskbarMediaControls {
 
         private bool _isPlaying;
         private bool _launchOnStartup;
+        private bool _hidden;
 
         private readonly ContextMenuStrip _trayMenu;
 
@@ -42,19 +44,22 @@ namespace TaskbarMediaControls {
         }
 
         public TrayAppContext() {
+            string exePath = Path.GetFullPath(Application.ExecutablePath);
             _launchOnStartup = !StartupEntryExists() || IsStartupEnabled();
             
+            _hidden = NotifyIconSettings.IsHidden(exePath);
 
             _trayMenu = BuildContextMenu();
 
-            _trayIcons[0] = CreateNotifyIcon(IconType.Previous, _tooltips[0], 0);
-            _trayIcons[1] = CreateNotifyIcon(IconType.Play, _tooltips[1], 1);
             _trayIcons[2] = CreateNotifyIcon(IconType.Next, _tooltips[2], 2);
+            _trayIcons[1] = CreateNotifyIcon(IconType.Play, _tooltips[1], 1);
+            _trayIcons[0] = CreateNotifyIcon(IconType.Previous, _tooltips[0], 0);
 
+            NotifyIconSettings.EnsureEntries(exePath, _tooltips, _hidden);
             Application.ApplicationExit += OnApplicationExit;
 
-            if (_launchOnStartup) SetStartup(true);
-            
+            if (_launchOnStartup)
+                SetStartup(true);
             SystemEvents.UserPreferenceChanged += SystemEventsOnUserPreferenceChanged;
         }
 
@@ -84,11 +89,76 @@ namespace TaskbarMediaControls {
             };
             menu.Items.Add(startupItem);
 
+            var hiddenItem = new ToolStripMenuItem("Hide from Taskbar") {
+                Checked = _hidden,
+                CheckOnClick = true
+            };
+            hiddenItem.CheckedChanged += (_, _) => {
+                _hidden = hiddenItem.Checked;
+                CheckAndUpdateRegistryValue(@"Control Panel\NotifyIconSettings");
+            };
+            menu.Items.Add(hiddenItem);
+
+            var vlcHotkeysItem = new ToolStripMenuItem("Configure VLC Hotkeys") {
+                Visible = VlcHotkeyManager.NeedsConfiguration
+            };
+            vlcHotkeysItem.Click += OnConfigureVlcHotkeys;
+            menu.Items.Add(vlcHotkeysItem);
+            menu.Opening += (_, _) => vlcHotkeysItem.Visible = VlcHotkeyManager.NeedsConfiguration;
+
             var exitItem = new ToolStripMenuItem("Exit");
             exitItem.Click += (_, _) => Application.Exit();
             menu.Items.Add(exitItem);
 
             return menu;
+        }
+
+        private void OnConfigureVlcHotkeys(object? sender, EventArgs e) {
+            var item = (ToolStripMenuItem)sender!;
+
+            if (!VlcHotkeyManager.IsVlcInstalled) {
+                MessageBox.Show(
+                    $"VLC's configuration file was not found:{Environment.NewLine}{VlcHotkeyManager.VlcrcPath}",
+                    "Taskbar Media Controls", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            string message =
+                "This will set the global hotkeys VLC needs to respond to the tray buttons:" +
+                Environment.NewLine + Environment.NewLine +
+                "  global-key-play-pause = Media Play Pause" + Environment.NewLine +
+                "  global-key-next       = Media Next Track" + Environment.NewLine +
+                "  global-key-prev       = Media Prev Track" + Environment.NewLine + Environment.NewLine +
+                "A backup is written to vlcrc.bak.";
+
+            if (VlcHotkeyManager.IsVlcRunning())
+                message += Environment.NewLine + "VLC is running and will be closed.";
+
+            message += Environment.NewLine + Environment.NewLine + "Continue?";
+
+            if (MessageBox.Show(message, "Configure VLC Hotkeys",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+                    MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                return;
+
+            try {
+                VlcHotkeyManager.ApplyHotkeys();
+            } catch (Exception ex) {
+                MessageBox.Show(
+                    $"Failed to update VLC's configuration:{Environment.NewLine}{ex.Message}",
+                    "Taskbar Media Controls", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            bool configured = VlcHotkeyManager.AreHotkeysConfigured();
+            item.Visible = !configured;
+
+            MessageBox.Show(
+                configured
+                    ? "VLC hotkeys configured."
+                    : "Attempted to update VLC's configuration, but the hotkeys still do not match.",
+                "Taskbar Media Controls", MessageBoxButtons.OK,
+                configured ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
         }
 
         private void OnApplicationExit(object? sender, EventArgs e) {
@@ -119,12 +189,10 @@ namespace TaskbarMediaControls {
                 if (enable) {
                     byte[] enabledValue = new byte[] { 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
                     approvedKey.SetValue(AppName, enabledValue, RegistryValueKind.Binary);
-                }
-                else {
+                } else {
                     approvedKey.DeleteValue(AppName, false);
                 }
-            }
-            catch (Exception ex) {
+            } catch (Exception ex) {
                 MessageBox.Show($"Failed to set startup: {ex.Message}");
             }
         }
@@ -132,17 +200,18 @@ namespace TaskbarMediaControls {
         private bool IsStartupEnabled() {
             try {
                 using var runKey = Registry.CurrentUser.OpenSubKey(RegistryRunKey);
-                if (runKey == null) return false;
+                if (runKey == null)
+                    return false;
 
                 var value = runKey.GetValue(AppName)?.ToString();
-                if (string.IsNullOrWhiteSpace(value)) return false;
+                if (string.IsNullOrWhiteSpace(value))
+                    return false;
 
                 value = value.Trim('"');
                 string exePath = Path.GetFullPath(Application.ExecutablePath);
 
                 return string.Equals(value, exePath, StringComparison.OrdinalIgnoreCase);
-            }
-            catch {
+            } catch {
                 return false;
             }
         }
@@ -164,8 +233,38 @@ namespace TaskbarMediaControls {
             try {
                 using var runKey = Registry.CurrentUser.OpenSubKey(RegistryRunKey);
                 return runKey?.GetValue(AppName) != null;
+            } catch { 
+                return false;
             }
-            catch { return false; }
+        }
+        private void CheckAndUpdateRegistryValue(string registryPath) {
+            const string propertyPromo = "IsPromoted";
+            const string propertyExe = "ExecutablePath";
+            string[] exeArr = ["TaskbarMediaControls.exe"];
+            using (var key = Registry.CurrentUser.OpenSubKey(registryPath, writable: true)) {
+                if (key != null) {
+                    var propertyValue = key.GetValue(propertyPromo);
+                    var exePath = key.GetValue(propertyExe);
+                    if (exePath != null) {
+                        exePath = exePath.ToString().Split('\\').Last().Trim();
+                        if (exeArr.Contains(exePath)) {
+                            if ((propertyValue == null || propertyValue.ToString() == "0") && !_hidden) {
+                                // If the key doesn't exist, create it and set its value to 1
+                                key.SetValue(propertyPromo, 1, RegistryValueKind.DWord);
+                            }
+                            if ((propertyValue == null || propertyValue.ToString() == "1") && _hidden) {
+                                // If the key doesn't exist, create it and set its value to 0
+                                key.SetValue(propertyPromo, 0, RegistryValueKind.DWord);
+                            }
+                        }
+                    }
+
+                    // Recursively check all subkeys
+                    foreach (string subkeyName in key.GetSubKeyNames()) {
+                        CheckAndUpdateRegistryValue(registryPath + "\\" + subkeyName);
+                    }
+                }
+            }
         }
     }
 }

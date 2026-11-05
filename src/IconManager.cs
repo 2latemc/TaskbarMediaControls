@@ -23,8 +23,7 @@ public static class IconManager {
     private static readonly string PauseIcon_Light = "TaskbarMediaControls.Resources.pause_light.ico";
     private static readonly string NextIcon_Light = "TaskbarMediaControls.Resources.skip_light.ico";
 
-    private static string GetIconPathForType(IconType type) {
-        bool isDarkMode = IsSystemDarkMode();
+    private static string GetIconPathForType(IconType type, bool isDarkMode) {
 
         switch (type) {
             case IconType.Previous:
@@ -47,15 +46,18 @@ public static class IconManager {
             var val = key?.GetValue("AppsUseLightTheme");
             Debug.WriteLine($"System dark mode: {val}");
             return val is int i && i == 0;
-        }
-        catch {
+        } catch {
             return true;
         }
     }
 
     public static Icon LoadIcon(IconType type) {
+        return LoadIcon(type, IsSystemDarkMode());
+    }
+
+    public static Icon LoadIcon(IconType type, bool isDarkMode) {
         var assembly = Assembly.GetExecutingAssembly();
-        using var stream = assembly.GetManifestResourceStream(GetIconPathForType(type));
+        using var stream = assembly.GetManifestResourceStream(GetIconPathForType(type, isDarkMode));
         if (stream == null)
             throw new Exception($"Resource not found: {type}");
 
